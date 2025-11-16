@@ -1,151 +1,119 @@
 """
-Agent and graph setup
+Agent and graph setup - FIXED VERSION without document tools
 """
 from typing import Annotated, TypedDict, Any
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
-from langgraph.graph import StateGraph, START
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
+from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 import config
 import memory
-import tools
+import tools  # Assuming tools.all_tools includes document tools, we will remove them below
 
 
 # ============ State Definition ============
 class ChatState(TypedDict):
-    """What data flows through the graph"""
     messages: Annotated[list[BaseMessage], add_messages]
 
 
 # ============ LLM Setup ============
-llm = ChatOpenAI(
-    model=config.LLM_MODEL,
-    openai_api_key=config.OPENROUTER_API_KEY,
-    openai_api_base="https://openrouter.ai/api/v1",
-    max_tokens=config.MAX_TOKENS
-)
+# llm = ChatOpenAI(
+#     model=config.LLM_MODEL,
+#     openai_api_key=config.OPENROUTER_API_KEY,
+#     openai_api_base="https://openrouter.ai/api/v1",
+#     max_tokens=config.MAX_TOKENS
+# )
+from langchain_google_genai import ChatGoogleGenerativeAI
+llm = ChatGoogleGenerativeAI(model='gemini-2.5-pro')
 
-llm_with_tools = llm.bind_tools(tools.all_tools)
-
-
-# ============ Agent Node ============
-
-
-"""
-Add this to your agent.py to fix token limit issues
-"""
-import tiktoken
-
-def count_tokens(messages):
-    """Count tokens in message list"""
-    try:
-        encoding = tiktoken.encoding_for_model("gpt-4")
-        total_tokens = 0
-        for msg in messages:
-            # Count message content
-            if hasattr(msg, 'content'):
-                total_tokens += len(encoding.encode(str(msg.content)))
-            # Add overhead for message formatting (~4 tokens per message)
-            total_tokens += 4
-        return total_tokens
-    except Exception:
-        # Fallback: rough estimate (4 chars = 1 token)
-        return sum(len(str(msg.content)) for msg in messages if hasattr(msg, 'content')) // 4
+# Remove document-related tools from tools.all_tools if any
+# For example, if your document tools are named 'doc_tool', remove them:
+non_doc_tools = [tool for tool in tools.all_tools if tool.name != "doc_tool"]
+llm_with_tools = llm.bind_tools(non_doc_tools)
 
 
-def truncate_messages(messages, max_tokens=10000):
-    """
-    Truncate old messages to stay within token limit
-    Keep system message, recent messages, and important context
-    """
-    if not messages:
-        return messages
-    
-    # Always keep system message if it exists
-    system_messages = [msg for msg in messages if hasattr(msg, 'type') and msg.type == 'system']
-    other_messages = [msg for msg in messages if msg not in system_messages]
-    
-    # Count current tokens
-    current_tokens = count_tokens(messages)
-    
-    if current_tokens <= max_tokens:
-        return messages
-    
-    # Keep recent messages (last 10 exchanges = 20 messages)
-    recent_count = min(20, len(other_messages))
-    recent_messages = other_messages[-recent_count:]
-    
-    # Check if recent messages fit
-    truncated = system_messages + recent_messages
-    truncated_tokens = count_tokens(truncated)
-    
-    if truncated_tokens <= max_tokens:
-        return truncated
-    
-    # If still too many, reduce further
-    while truncated_tokens > max_tokens and len(recent_messages) > 4:
-        recent_messages = recent_messages[-len(recent_messages)//2:]
-        truncated = system_messages + recent_messages
-        truncated_tokens = count_tokens(truncated)
-    
-    return truncated
-
-
-# Update your chat_node function in agent.py:
+# ============ Chat Node (FIXED) ============
 def chat_node(state: ChatState, config: Any = None):
-    """Main chat processing node with token management"""
+    """Main chat node with proper tool handling"""
+
     if config is None:
         config = {}
+
+    thread_id = config.get("configurable", {}).get("thread_id", "default-thread")
     messages = state.get("messages", [])
-    thread_id = config['configurable'].get('thread_id')
-    
-    # Get the last user message
-    user_message = messages[-1].content if messages else ""
-    
-    # CRITICAL FIX: Truncate messages to avoid token limit
-    messages = truncate_messages(messages, max_tokens=10000)
-    
-    # Try to retrieve relevant memories
-    try:
-        relevant_memories = memory.retrieve_memory(thread_id, user_message, limit=3)
-        
-        if relevant_memories:
-            context = "\n".join([f"- {mem}" for mem in relevant_memories])
-            context_message = f"\n\nRelevant context from earlier:\n{context}"
-            
-            # Add context to the last message
-            enriched_messages = messages[:-1] + [
-                HumanMessage(content=f"{user_message}{context_message}")
-            ]
-        else:
+
+    if not messages:
+        return {"messages": []}
+
+    # Debug message types
+    print(f"\n📨 Processing {len(messages)} messages")
+    for i, msg in enumerate(messages[-3:]):
+        print(f"  Message {i}: {type(msg).__name__}")
+
+    last_message = messages[-1]
+    is_user_message = isinstance(last_message, HumanMessage)
+
+    if is_user_message:
+        user_message = last_message.content
+
+        try:
+            relevant_memories = memory.retrieve_memory(thread_id, user_message, limit=3)
+
+            if relevant_memories:
+                context = "\n".join([f"- {m}" for m in relevant_memories])
+                enriched_last = HumanMessage(
+                    content=f"{user_message}\n\nRelevant context:\n{context}"
+                )
+                enriched_messages = messages[:-1] + [enriched_last]
+            else:
+                enriched_messages = messages
+
+        except Exception as e:
+            print(f"⚠️ Memory retrieval skipped: {e}")
             enriched_messages = messages
-    except Exception as e:
-        print(f"⚠️ Memory retrieval skipped: {e}")
+
+        memory.store_memory(thread_id, user_message, "user")
+
+    else:
         enriched_messages = messages
-    
-    # Get AI response
-    response = llm_with_tools.invoke(enriched_messages)
-    
-    # Save to memory
-    memory.store_memory(thread_id, user_message, "user")
-    memory.store_memory(thread_id, response.content, "assistant")
-    
+
+    try:
+        response = llm_with_tools.invoke(enriched_messages)
+    except Exception as e:
+        print(f"❌ LLM invocation failed: {e}")
+        raise
+
+    if hasattr(response, 'content') and response.content:
+        memory.store_memory(thread_id, response.content, "assistant")
+
     return {"messages": [response]}
 
-# ============ Build Graph ============
+
+# ============ Build LangGraph (FIXED) ============
 graph = StateGraph(ChatState)
 
 # Add nodes
 graph.add_node("chat_node", chat_node)
-graph.add_node("tools", ToolNode(tools.all_tools))
+graph.add_node("tools", ToolNode(non_doc_tools))
 
-# Add edges
+# Start with chat
 graph.add_edge(START, "chat_node")
-graph.add_conditional_edges("chat_node", tools_condition)
+
+# Proper conditional routing
+graph.add_conditional_edges(
+    "chat_node",
+    tools_condition,
+    {
+        "tools": "tools",
+        END: END
+    }
+)
+
+# After tools execute, go back to chat_node
 graph.add_edge("tools", "chat_node")
 
-# Compile
+# Compile with checkpointer
 chatbot = graph.compile(checkpointer=memory.checkpointer)
 
-print("✅ Chatbot ready!")
+print("✅ Chatbot ready without document tools!")

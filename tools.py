@@ -226,9 +226,6 @@ def translate_text(text: str, target_language: str = "en", source_language: str 
         return {"error": f"Translation failed: {str(e)}"}
 
 
-# ============ Import Document Tool ============
-from document_analyzer import ask_document
-
 
 # ============ Export All Tools ============
 all_tools = [
@@ -238,6 +235,5 @@ all_tools = [
     get_stock_price,
     search_wikipedia,
     get_weather,
-    translate_text,
-    ask_document  # PDF/Document Q&A
+    translate_text
 ]

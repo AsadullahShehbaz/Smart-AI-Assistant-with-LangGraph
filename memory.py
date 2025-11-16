@@ -78,7 +78,7 @@ def store_memory(thread_id, message_text, role):
     Args:
         thread_id: conversation ID
         message_text: the message
-        role: "user" or "assistant"
+        role: "user" or "assistant" or "system"
     """
     try:
         # Convert text to vector
@@ -174,9 +174,8 @@ def generate_conversation_title(thread_id, first_message):
     try:
         from agent import llm
         
-        # Create a focused prompt for title generation
         prompt = f"""Generate a concise 3-5 word title for a conversation that starts with:
-"{first_message[:150]}"
+\"{first_message[:150]}\"
 
 Requirements:
 - Must be 3-5 words maximum
@@ -189,18 +188,16 @@ Title:"""
         response = llm.invoke(prompt)
         title = response.content.strip().strip('"').strip("'")
         
-        # Ensure it's not too long
         words = title.split()
         if len(words) > 5:
             title = ' '.join(words[:5])
         
-        # Store in Qdrant with special marker
+        # Store in memory as a system role message
         store_memory(thread_id, f"TITLE:{title}", "system")
         return title
         
     except Exception as e:
         print(f"⚠️ Error generating title: {e}")
-        # Fallback to first 30 chars
         return first_message[:30] + "..." if len(first_message) > 30 else first_message
 
 
@@ -209,7 +206,6 @@ def get_conversation_title(thread_id):
     thread_id_str = str(thread_id)
     
     try:
-        # 1. Check for existing smart-generated title
         results, _ = qdrant_client.scroll(
             collection_name=config.COLLECTION_NAME,
             scroll_filter={
@@ -224,9 +220,8 @@ def get_conversation_title(thread_id):
         
         for point in results:
             if point.payload.get("text", "").startswith("TITLE:"):
-                return point.payload.get("text")[6:]  # Return text after "TITLE:"
-
-        # 2. No title exists, get all user messages and find the first one
+                return point.payload.get("text")[6:]
+        
         results, _ = qdrant_client.scroll(
             collection_name=config.COLLECTION_NAME,
             scroll_filter={
@@ -240,16 +235,13 @@ def get_conversation_title(thread_id):
         )
         
         if results:
-            # Sort by timestamp to get the earliest message
             sorted_results = sorted(results, key=lambda x: x.payload.get("timestamp", 0))
             first_user_message = sorted_results[0].payload.get("text", "")
             
             if first_user_message:
-                # Generate and store the title
                 title = generate_conversation_title(thread_id, first_user_message)
                 return title
-
-        # 3. Final Fallback: Short UUID
+        
         return f"Chat {thread_id_str[:8]}"
         
     except Exception as e:
